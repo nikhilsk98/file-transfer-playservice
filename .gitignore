@@ -46,8 +46,3 @@ e2e-results/
 
 # Built programs
 bin/
-
-# AI-assistant config files: never track
-CLAUDE.md
-CLAUDE.local.md
-.claude/
