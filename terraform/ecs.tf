@@ -5,6 +5,12 @@ data "aws_iam_role" "lab" {
 
 resource "aws_ecs_cluster" "main" {
   name = "file-transfer"
+
+  # Midterm: Container Insights publishes RunningTaskCount / DesiredTaskCount per service
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
 }
 
 resource "aws_cloudwatch_log_group" "gateway" {
