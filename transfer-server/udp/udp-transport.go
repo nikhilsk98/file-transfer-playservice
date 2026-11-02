@@ -8,8 +8,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	"example.com/go-file-transfer/metrics"
 	"example.com/go-file-transfer/transfer-server/loss"
 	"example.com/go-file-transfer/transfer-server/protocol"
+)
+
+// Midterm instrumentation: counts of simulated drops and real sends.
+var (
+	mSendDropped = protocol.Metrics.Counter("SimulatedSendDrops")
+	mRecvDropped = protocol.Metrics.Counter("SimulatedRecvDrops")
+	mSent        = protocol.Metrics.Counter("DatagramsSent")
+	mSendErrors  = protocol.Metrics.Counter("SendErrors")
+	quiet        = metrics.Quiet()
 )
 
 // UDPTransport implements protocol.Transport over a single UDP socket,
@@ -52,6 +62,10 @@ func (transport *UDPTransport) Receive() (string, protocol.Peer, error) {
 			return "", nil, err
 		}
 		if loss.ShouldDrop(transport.recvLossPercent) {
+			mRecvDropped.Inc()
+			if quiet {
+				continue
+			}
 			fmt.Fprintf(os.Stderr, "DEBUG: Simulated loss: dropped incoming datagram (%v bytes)\n", n)
 			continue
 		}
@@ -68,9 +82,18 @@ func (transport *UDPTransport) Receive() (string, protocol.Peer, error) {
 // Side effects: sends a datagram to to, or logs the drop to stderr instead.
 func (transport *UDPTransport) Send(to protocol.Peer, message []byte) error {
 	if loss.ShouldDrop(transport.sendLossPercent) {
+		mSendDropped.Inc()
+		if quiet {
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "DEBUG: Simulated loss: dropped outgoing datagram (%v bytes)\n", len(message))
 		return nil
 	}
 	_, err := transport.conn.WriteTo(message, to)
+	if err != nil {
+		mSendErrors.Inc()
+	} else {
+		mSent.Inc()
+	}
 	return err
 }

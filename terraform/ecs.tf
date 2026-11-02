@@ -49,13 +49,14 @@ resource "aws_ecs_task_definition" "backend" {
       { name = "WORKERS", value = tostring(var.backend_workers) },
       { name = "SEND_LOSS", value = tostring(var.backend_send_loss) },
       { name = "RECV_LOSS", value = tostring(var.backend_recv_loss) },
-      { name = "AWS_REGION", value = "us-west-2" },
+      { name = "QUIET", value = var.quiet_logs ? "1" : "0" },
+      { name = "AWS_REGION", value = var.region },
     ]
     logConfiguration = {
       logDriver = "awslogs"
       options = {
         awslogs-group         = aws_cloudwatch_log_group.backend.name
-        awslogs-region        = "us-west-2"
+        awslogs-region        = var.region
         awslogs-stream-prefix = "backend"
       }
     }
@@ -89,12 +90,18 @@ resource "aws_ecs_task_definition" "gateway" {
       { name = "TRANSPORT", value = "udp" },
       { name = "UPSTREAM", value = "${aws_lb.backend.dns_name}:8080" },
       { name = "MAX_INFLIGHT", value = tostring(var.max_inflight) },
+      { name = "QUEUE_WAIT", value = tostring(var.gateway_queue_wait) },
+      { name = "OPEN_ATTEMPTS", value = tostring(var.open_attempts) },
+      { name = "RETRY_ROUNDS", value = tostring(var.retry_rounds) },
+      { name = "READ_TIMEOUT_MS", value = tostring(var.read_timeout_ms) },
+      { name = "ALLOW_BUDGET_OVERRIDE", value = var.allow_budget_override ? "1" : "0" },
+      { name = "QUIET", value = var.quiet_logs ? "1" : "0" },
     ]
     logConfiguration = {
       logDriver = "awslogs"
       options = {
         awslogs-group         = aws_cloudwatch_log_group.gateway.name
-        awslogs-region        = "us-west-2"
+        awslogs-region        = var.region
         awslogs-stream-prefix = "gateway"
       }
     }

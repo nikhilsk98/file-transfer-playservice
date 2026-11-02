@@ -12,8 +12,12 @@ import (
 	"strings"
 	"time"
 
+	"example.com/go-file-transfer/metrics"
 	transferdata "example.com/go-file-transfer/transfer-data"
 )
+
+// quiet shortens the per-round "Missing chunks" log line (env QUIET=1).
+var quiet = metrics.Quiet()
 
 // How long the server may stay quiet before the client decides it is done sending,
 // how many rounds of RETY requests the client makes before giving up, and the largest
@@ -22,15 +26,68 @@ import (
 // maxOpenAttempts is how many times OPEN is sent, on a fresh socket each time, when nothing
 // comes back. With 2s timeouts, 5 OPEN attempts plus 5 retry rounds wait at most about 20s,
 // well inside a load balancer's 60s idle timeout.
-const (
-	maxRetryRounds  = 5
-	maxOpenAttempts = 5
-	maxChunks       = 65536
+//
+// Midterm instrumentation: maxRetryRounds, maxOpenAttempts and readTimeout used to be
+// constants. They now default to the same values (5, 5, 2s) but can be set with the
+// environment variables RETRY_ROUNDS, OPEN_ATTEMPTS and READ_TIMEOUT_MS, and a single call
+// can override them with FetchWithStats.
+const maxChunks = 65536
+
+var (
+	maxRetryRounds  = envInt("RETRY_ROUNDS", 5)
+	maxOpenAttempts = envInt("OPEN_ATTEMPTS", 5)
+	// readTimeout is how long the server may stay quiet.
+	readTimeout = time.Duration(envInt("READ_TIMEOUT_MS", 2000)) * time.Millisecond
 )
 
-// readTimeout is how long the server may stay quiet. It is a variable only so tests can
-// shorten it.
-var readTimeout = 2 * time.Second
+// envInt reads a positive integer from the environment, or returns fallback.
+func envInt(name string, fallback int) int {
+	value, err := strconv.Atoi(os.Getenv(name))
+	if err != nil || value < 1 {
+		return fallback
+	}
+	return value
+}
+
+// Budget is how hard one Fetch tries before giving up. Zero fields mean "use the default".
+type Budget struct {
+	OpenAttempts int
+	RetryRounds  int
+	ReadTimeout  time.Duration
+}
+
+// DefaultBudget returns the process-wide budget (from the environment or the built-in defaults).
+func DefaultBudget() Budget {
+	return Budget{OpenAttempts: maxOpenAttempts, RetryRounds: maxRetryRounds, ReadTimeout: readTimeout}
+}
+
+func (b Budget) withDefaults() Budget {
+	d := DefaultBudget()
+	if b.OpenAttempts < 1 {
+		b.OpenAttempts = d.OpenAttempts
+	}
+	if b.RetryRounds < 0 {
+		b.RetryRounds = d.RetryRounds
+	}
+	if b.ReadTimeout <= 0 {
+		b.ReadTimeout = d.ReadTimeout
+	}
+	return b
+}
+
+// Stats describes what one Fetch did. It is filled in even when Fetch fails.
+type Stats struct {
+	OpenAttempts       int // OPEN messages sent (one per fresh socket)
+	RetryRounds        int // rounds of RETY requests sent
+	RetyRequests       int // RETY datagrams sent in total
+	Redials            int // new sockets opened after a silent retry round
+	Chunks             int // NUM_CHUNKS announced by the server (0 if nothing arrived)
+	DatagramsReceived  int // valid file datagrams received, duplicates included
+	DuplicateDatagrams int // datagrams for a chunk that was already received
+	MissingAfterOpen   int // chunks still missing after the OPEN phase
+	MissingAtEnd       int // chunks still missing when Fetch returned
+	Budget             Budget
+}
 
 // ServerError is returned when the server answers a request with "ERR <message>".
 // Message holds the text after "ERR " (for example "file-not-found").
@@ -111,6 +168,20 @@ func RunClient(args []string) {
 // Side effects: opens and closes a UDP socket, writes OPEN and RETY datagrams, sets read
 // deadlines on that socket, and logs progress to stderr.
 func Fetch(address string, filename string) ([]byte, error) {
+	data, _, err := FetchWithStats(address, filename, Budget{RetryRounds: -1})
+	return data, err
+}
+
+// FetchWithStats is Fetch with a per-call retry budget (zero/negative fields use the
+// defaults; RetryRounds 0 means "no RETY rounds") and returns what the call did.
+func FetchWithStats(address string, filename string, budget Budget) ([]byte, Stats, error) {
+	budget = budget.withDefaults()
+	stats := Stats{Budget: budget}
+	data, err := fetch(address, filename, budget, &stats)
+	return data, stats, err
+}
+
+func fetch(address string, filename string, budget Budget, stats *Stats) ([]byte, error) {
 	var conn *net.UDPConn
 	defer func() {
 		if conn != nil {
@@ -120,8 +191,9 @@ func Fetch(address string, filename string) ([]byte, error) {
 
 	chunks := make(map[int]transferdata.TCP_Pack)
 	num_chunks := 0
-	for attempt := 0; attempt < maxOpenAttempts && num_chunks == 0; attempt++ {
+	for attempt := 0; attempt < budget.OpenAttempts && num_chunks == 0; attempt++ {
 		var err error
+		stats.OpenAttempts++
 		conn, err = redial(conn, address)
 		if err != nil {
 			return nil, err
@@ -130,17 +202,20 @@ func Fetch(address string, filename string) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("sending OPEN: %w", err)
 		}
-		num_chunks, err = readChunks(conn, chunks)
+		num_chunks, err = readChunks(conn, chunks, budget.ReadTimeout, stats)
 		if err != nil {
 			return nil, err
 		}
 	}
+	stats.Chunks = num_chunks
 	if num_chunks == 0 {
 		return nil, ErrNoData
 	}
+	stats.MissingAfterOpen = len(missingChunkIds(chunks, num_chunks))
+	stats.MissingAtEnd = stats.MissingAfterOpen
 
 	silent := false
-	for round := 0; round < maxRetryRounds; round++ {
+	for round := 0; round < budget.RetryRounds; round++ {
 		missing := missingChunkIds(chunks, num_chunks)
 		if len(missing) == 0 {
 			break
@@ -148,20 +223,29 @@ func Fetch(address string, filename string) ([]byte, error) {
 		if silent {
 			// The last round brought nothing back: that server may be gone or the flow dead.
 			var err error
+			stats.Redials++
 			conn, err = redial(conn, address)
 			if err != nil {
 				return nil, err
 			}
 		}
-		fmt.Fprintf(os.Stderr, "Missing chunks %v, retrying\n", missing)
+		stats.RetryRounds++
+		if quiet {
+			// The full list can hold thousands of IDs per round; log only the count.
+			fmt.Fprintf(os.Stderr, "Missing %d of %d chunks, retry round %d\n", len(missing), num_chunks, round+1)
+		} else {
+			fmt.Fprintf(os.Stderr, "Missing chunks %v, retrying\n", missing)
+		}
 		for _, id := range missing {
+			stats.RetyRequests++
 			_, err := fmt.Fprintf(conn, "RETY %v %v", filename, id)
 			if err != nil {
 				return nil, fmt.Errorf("sending RETY: %w", err)
 			}
 		}
 		before := len(chunks)
-		_, err := readChunks(conn, chunks)
+		_, err := readChunks(conn, chunks, budget.ReadTimeout, stats)
+		stats.MissingAtEnd = len(missingChunkIds(chunks, num_chunks))
 		if err != nil {
 			return nil, err
 		}
@@ -169,7 +253,11 @@ func Fetch(address string, filename string) ([]byte, error) {
 	}
 
 	missing := missingChunkIds(chunks, num_chunks)
+	stats.MissingAtEnd = len(missing)
 	if len(missing) > 0 {
+		if quiet && len(missing) > 10 {
+			return nil, fmt.Errorf("%w: %d chunks, first %v", ErrIncomplete, len(missing), missing[:10])
+		}
 		return nil, fmt.Errorf("%w: %v", ErrIncomplete, missing)
 	}
 
@@ -234,10 +322,10 @@ func redial(old *net.UDPConn, address string) (*net.UDPConn, error) {
 // returns a nil error. Malformed datagrams are logged and skipped.
 // Side effects: sets a read deadline on conn before every read, mutates chunks, and logs
 // skipped datagrams to stderr.
-func readChunks(conn *net.UDPConn, chunks map[int]transferdata.TCP_Pack) (int, error) {
+func readChunks(conn *net.UDPConn, chunks map[int]transferdata.TCP_Pack, timeout time.Duration, stats *Stats) (int, error) {
 	num_chunks := 0
 	for {
-		conn.SetReadDeadline(time.Now().Add(readTimeout))
+		conn.SetReadDeadline(time.Now().Add(timeout))
 		buf := [1024]byte{}
 		n_bytes, _, err := conn.ReadFromUDP(buf[:])
 		if err != nil {
@@ -257,6 +345,10 @@ func readChunks(conn *net.UDPConn, chunks map[int]transferdata.TCP_Pack) (int, e
 			fmt.Fprintf(os.Stderr, "Ignoring bad datagram: %v\n", err)
 			continue
 		}
+		if _, seen := chunks[id]; seen {
+			stats.DuplicateDatagrams++
+		}
+		stats.DatagramsReceived++
 		chunks[id] = pack
 		num_chunks = total
 	}

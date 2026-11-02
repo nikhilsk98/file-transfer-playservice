@@ -14,7 +14,7 @@ resource "aws_lb_target_group" "backend" {
   protocol             = "UDP"
   target_type          = "ip"
   vpc_id               = data.aws_vpc.default.id
-  deregistration_delay = 60
+  deregistration_delay = var.deregistration_delay
   preserve_client_ip   = "true"
 
   # A UDP target group cannot health-check UDP, so it asks the server's TCP health port

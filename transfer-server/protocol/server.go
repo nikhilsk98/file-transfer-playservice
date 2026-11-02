@@ -8,12 +8,49 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"example.com/go-file-transfer/metrics"
 	tcpdata "example.com/go-file-transfer/transfer-data"
 )
 
+// Metrics are the backend's process-wide counters (midterm instrumentation), printed every
+// 10s as CloudWatch EMF by the server's RunServer.
+var Metrics = metrics.NewRegistry("backend")
+
+var (
+	mReceived      = Metrics.Counter("MessagesAccepted")
+	mOverload      = Metrics.Counter("OverloadDrops")
+	mOpens         = Metrics.Counter("OpenRequests")
+	mRetys         = Metrics.Counter("RetyRequests")
+	mSourceFetches = Metrics.Counter("SourceFetches")
+	mSourceMs      = Metrics.Counter("SourceFetchMsTotal")
+	mBusy          = Metrics.Gauge("BusyWorkers")
+	mQueue         = Metrics.Gauge("QueuedJobs")
+)
+
+// quiet turns off the per-message DEBUG lines (env QUIET=1); the counters above replace them.
+var quiet = metrics.Quiet()
+
 func printDebugMessage(message string) {
+	if quiet {
+		return
+	}
 	fmt.Fprintf(os.Stderr, "DEBUG: %v\n", message)
+}
+
+// printError always logs, even when quiet.
+func printError(message string) {
+	fmt.Fprintf(os.Stderr, "ERROR: %v\n", message)
+}
+
+// fetchSource times one read of the file from S3 (or disk).
+func fetchSource(source FileSource, name string) ([]byte, error) {
+	started := time.Now()
+	data, err := source.Fetch(name)
+	mSourceFetches.Inc()
+	mSourceMs.Add(time.Since(started).Milliseconds())
+	return data, err
 }
 
 // FileSource supplies the bytes of a named file. Fetch must be safe for concurrent use.
@@ -59,7 +96,10 @@ func Serve(transport Transport, source FileSource, workers int) {
 		go func() {
 			defer running.Done()
 			for next := range jobs {
+				mQueue.Add(-1)
+				mBusy.Add(1)
 				handleCommand(transport, source, next.message, next.from)
+				mBusy.Add(-1)
 			}
 		}()
 	}
@@ -77,9 +117,13 @@ func Serve(transport Transport, source FileSource, workers int) {
 		}
 		// A non-blocking send: if the queue is full we drop the message instead of
 		// stalling the reader, which would bring back one-request-at-a-time behavior.
+		mQueue.Add(1)
 		select {
 		case jobs <- job{message: message, from: from}:
+			mReceived.Inc()
 		default:
+			mQueue.Add(-1)
+			mOverload.Inc()
 			printDebugMessage("Overloaded: dropped incoming datagram")
 		}
 	}
@@ -124,10 +168,11 @@ func handleCommand(transport Transport, source FileSource, message string, from 
 // The file is only held in local variables, so it is freed once the send finishes.
 func handleOpen(transport Transport, source FileSource, to Peer, filename string) {
 	printDebugMessage(fmt.Sprintf("Processing OPEN for file: \"%v\"", filename))
+	mOpens.Inc()
 
-	file_data, err := source.Fetch(filename)
+	file_data, err := fetchSource(source, filename)
 	if err != nil {
-		printDebugMessage("Error fetching file: " + err.Error())
+		printError("Error fetching file: " + err.Error())
 		sendError(transport, to, "file-not-found")
 		return
 	}
@@ -146,10 +191,11 @@ func handleOpen(transport Transport, source FileSource, to Peer, filename string
 // The file is fetched from source again and dropped after the chunk is sent.
 func handleRetry(transport Transport, source FileSource, to Peer, filename string, idText string) {
 	printDebugMessage(fmt.Sprintf("Processing RETY for file: \"%v\" chunk %v", filename, idText))
+	mRetys.Inc()
 
-	file_data, err := source.Fetch(filename)
+	file_data, err := fetchSource(source, filename)
 	if err != nil {
-		printDebugMessage("Error fetching file: " + err.Error())
+		printError("Error fetching file: " + err.Error())
 		sendError(transport, to, "file-not-found")
 		return
 	}

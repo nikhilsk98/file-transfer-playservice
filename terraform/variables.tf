@@ -96,3 +96,65 @@ variable "backend_recv_loss" {
     error_message = "backend_recv_loss must be from 0 to 100."
   }
 }
+
+# ---- Added for the CS6650 midterm experiments ----
+
+variable "region" {
+  type        = string
+  description = "AWS region for the whole stack"
+  default     = "us-east-1"
+}
+
+variable "quiet_logs" {
+  type        = bool
+  description = "QUIET=1: drop per-datagram DEBUG lines (counters are printed as EMF every 10s instead)"
+  default     = true
+}
+
+variable "open_attempts" {
+  type        = number
+  description = "OPEN attempts per transfer in the gateway's client (OPEN_ATTEMPTS)"
+  default     = 5
+}
+
+variable "retry_rounds" {
+  type        = number
+  description = "RETY rounds per transfer in the gateway's client (RETRY_ROUNDS)"
+  default     = 5
+}
+
+variable "read_timeout_ms" {
+  type        = number
+  description = "How long the client waits for a quiet server before ending a round (READ_TIMEOUT_MS)"
+  default     = 2000
+}
+
+variable "allow_budget_override" {
+  type        = bool
+  description = "Let a request override the retry budget with query parameters (ALLOW_BUDGET_OVERRIDE)"
+  default     = true
+}
+
+variable "gateway_queue_wait" {
+  type        = number
+  description = "Seconds a request waits for a gateway in-flight slot before 503 (QUEUE_WAIT)"
+  default     = 5
+}
+
+variable "scale_out_cooldown" {
+  type        = number
+  description = "Target tracking scale-out cooldown in seconds (both services)"
+  default     = 60
+}
+
+variable "scale_in_cooldown" {
+  type        = number
+  description = "Target tracking scale-in cooldown in seconds (both services)"
+  default     = 120
+}
+
+variable "deregistration_delay" {
+  type        = number
+  description = "Seconds a load balancer waits for a removed target to finish (both LBs)"
+  default     = 60
+}

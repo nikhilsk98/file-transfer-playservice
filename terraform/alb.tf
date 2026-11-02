@@ -12,7 +12,7 @@ resource "aws_lb_target_group" "gateway" {
   protocol             = "HTTP"
   target_type          = "ip" # Fargate tasks register by IP address
   vpc_id               = data.aws_vpc.default.id
-  deregistration_delay = 60 # at least the gateway's 5s drain plus a typical transfer
+  deregistration_delay = var.deregistration_delay # at least the gateway's 5s drain plus a typical transfer
 
   health_check {
     path                = "/health" # 200 while serving, 503 once the task is draining

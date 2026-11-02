@@ -16,8 +16,8 @@ resource "aws_appautoscaling_policy" "gateway" {
 
   target_tracking_scaling_policy_configuration {
     target_value       = var.gateway_requests_per_target
-    scale_out_cooldown = 60
-    scale_in_cooldown  = 120
+    scale_out_cooldown = var.scale_out_cooldown
+    scale_in_cooldown  = var.scale_in_cooldown
 
     predefined_metric_specification {
       predefined_metric_type = "ALBRequestCountPerTarget"
@@ -44,8 +44,8 @@ resource "aws_appautoscaling_policy" "backend" {
 
   target_tracking_scaling_policy_configuration {
     target_value       = var.backend_cpu_target
-    scale_out_cooldown = 60
-    scale_in_cooldown  = 120
+    scale_out_cooldown = var.scale_out_cooldown
+    scale_in_cooldown  = var.scale_in_cooldown
 
     predefined_metric_specification {
       predefined_metric_type = "ECSServiceAverageCPUUtilization"

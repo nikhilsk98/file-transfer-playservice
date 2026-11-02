@@ -149,6 +149,8 @@ func RunServer(args []string) {
 		transport.StopReceiving()
 	}()
 
+	protocol.Metrics.Start(10 * time.Second)
+	fmt.Printf("{\"evt\":\"config\",\"send_loss\":%d,\"recv_loss\":%d,\"workers\":%d,\"queue\":%d}\n", sendLossPercent, recvLossPercent, workers, workers*4)
 	protocol.Serve(transport, source, workers)
 }
 

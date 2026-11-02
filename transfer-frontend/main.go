@@ -77,7 +77,20 @@ func main() {
 	}
 
 	fmt.Printf("Serving http://%v/files, fetching over %v from %v (up to %v at once)\n", listen, transport, upstream, maxInFlight)
-	frontend := gateway.New(upstream, fetch, maxInFlight, queueWait)
+	// Midterm instrumentation: the UDP fetcher reports per-request stats, and with
+	// ALLOW_BUDGET_OVERRIDE=1 a request may set its own retry budget via query parameters.
+	allowOverride := os.Getenv("ALLOW_BUDGET_OVERRIDE") == "1"
+	instrumented := gateway.InstrumentedFetcher(udp.FetchWithStats)
+	if transport != "udp" {
+		instrumented = func(address string, filename string, budget udp.Budget) ([]byte, udp.Stats, error) {
+			data, err := fetch(address, filename)
+			return data, udp.Stats{Budget: budget}, err
+		}
+	}
+	b := udp.DefaultBudget()
+	fmt.Printf("Retry budget: %v OPEN attempts, %v RETY rounds, %v read timeout (per-request override: %v)\n", b.OpenAttempts, b.RetryRounds, b.ReadTimeout, allowOverride)
+	frontend := gateway.NewInstrumented(upstream, instrumented, maxInFlight, queueWait, allowOverride)
+	gateway.Metrics.Start(10 * time.Second)
 
 	// On SIGTERM (a scale-in or deploy) report unhealthy first so the load balancer stops
 	// sending new requests, wait for it to notice, let running downloads finish, then exit.

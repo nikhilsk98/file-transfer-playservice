@@ -4,9 +4,12 @@
 package gateway
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"example.com/go-file-transfer/metrics"
 	"example.com/go-file-transfer/transfer-client/tcp"
 	"example.com/go-file-transfer/transfer-client/udp"
 )
@@ -29,6 +33,34 @@ const DefaultQueueWait = 5 * time.Second
 // Fetcher downloads one file from an FTP_6650 server. Production code passes udp.Fetch or tcp.Fetch;
 // tests pass a fake so the handler can be tested without a network.
 type Fetcher func(address string, filename string) ([]byte, error)
+
+// InstrumentedFetcher is a Fetcher that takes a per-request retry budget and reports what it
+// did (midterm instrumentation). udp.FetchWithStats is one.
+type InstrumentedFetcher func(address string, filename string, budget udp.Budget) ([]byte, udp.Stats, error)
+
+// plain adapts a Fetcher that has no budget or stats (tcp.Fetch, test fakes).
+func plain(fetch Fetcher) InstrumentedFetcher {
+	return func(address string, filename string, budget udp.Budget) ([]byte, udp.Stats, error) {
+		data, err := fetch(address, filename)
+		return data, udp.Stats{Budget: budget}, err
+	}
+}
+
+// Metrics are the gateway's process-wide counters, printed every 10s as CloudWatch EMF by main.
+var Metrics = metrics.NewRegistry("gateway")
+
+var (
+	mRequests   = Metrics.Counter("Requests")
+	mOK         = Metrics.Counter("Responses200")
+	mBusy503    = Metrics.Counter("RejectedBusy503")
+	mTimeout504 = Metrics.Counter("Timeout504")
+	mOther      = Metrics.Counter("OtherErrors")
+	mRety       = Metrics.Counter("RetyRequestsSent")
+	mRounds     = Metrics.Counter("RetryRounds")
+	mOpens      = Metrics.Counter("OpenAttempts")
+	mInflight   = Metrics.Gauge("InFlight")
+	mWaiting    = Metrics.Gauge("WaitingForSlot")
+)
 
 // Gateway is the HTTP frontend: a Gin engine plus the state a graceful shutdown needs.
 type Gateway struct {
@@ -76,6 +108,13 @@ func (gateway *Gateway) WaitIdle(timeout time.Duration) bool {
 // with no capacity would block every request forever.
 // Side effects: none until the returned router serves requests.
 func New(upstream string, fetch Fetcher, maxInFlight int, queueWait time.Duration) *Gateway {
+	return NewInstrumented(upstream, plain(fetch), maxInFlight, queueWait, false)
+}
+
+// NewInstrumented is New with a fetcher that reports stats. When allowOverride is true the
+// query parameters open_attempts, retry_rounds and read_timeout_ms override the retry budget
+// for that one request (an experiment hook so the budget can be swept without redeploying).
+func NewInstrumented(upstream string, fetch InstrumentedFetcher, maxInFlight int, queueWait time.Duration, allowOverride bool) *Gateway {
 	// inflight is a counting semaphore: it lets at most cap(inflight) transfers run at once.
 	//
 	// If you know sync.Mutex: a Mutex is a semaphore with exactly one permit. Lock takes the
@@ -105,7 +144,7 @@ func New(upstream string, fetch Fetcher, maxInFlight int, queueWait time.Duratio
 	router := gin.New()
 	// A load balancer polls /health every few seconds, so keep it out of the request log.
 	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health"}}), gin.Recovery())
-	router.GET("/files", handleGetFile(upstream, fetch, inflight, queueWait))
+	router.GET("/files", handleGetFile(upstream, fetch, inflight, queueWait, allowOverride))
 	router.GET("/health", gateway.handleHealthCheck())
 	gateway.Router = router
 	return gateway
@@ -136,7 +175,7 @@ func (gateway *Gateway) handleHealthCheck() gin.HandlerFunc {
 // within queueWait it replies 503 with a Retry-After header, also without calling fetch.
 // Side effects: each request waits for a semaphore permit, then opens a UDP socket to the
 // upstream and exchanges datagrams with it (inside fetch).
-func handleGetFile(upstream string, fetch Fetcher, inflight chan struct{}, queueWait time.Duration) gin.HandlerFunc {
+func handleGetFile(upstream string, fetch InstrumentedFetcher, inflight chan struct{}, queueWait time.Duration, allowOverride bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		name := c.Query("name")
 		err := validateName(name)
@@ -144,29 +183,59 @@ func handleGetFile(upstream string, fetch Fetcher, inflight chan struct{}, queue
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		mRequests.Inc()
+		budget := udp.Budget{RetryRounds: -1} // -1: use the process default
+		if allowOverride {
+			budget = budgetFromQuery(c, budget)
+		}
 
 		// Acquire a permit, or give up if the client leaves or the wait runs out.
+		arrived := time.Now()
+		mWaiting.Add(1)
 		timer := time.NewTimer(queueWait)
 		defer timer.Stop()
 		select {
 		case inflight <- struct{}{}:
-			defer func() { <-inflight }() // release the permit when this request ends
+			mWaiting.Add(-1)
+			mInflight.Add(1)
+			defer func() { <-inflight; mInflight.Add(-1) }() // release the permit when this request ends
 		case <-c.Request.Context().Done():
+			mWaiting.Add(-1)
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		case <-timer.C:
+			mWaiting.Add(-1)
+			mBusy503.Inc()
+			c.Header("X-Queue-Wait-Ms", strconv.FormatInt(time.Since(arrived).Milliseconds(), 10))
+			c.Header("X-Task", taskHost)
 			c.Header("Retry-After", strconv.Itoa(1))
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "the gateway is busy, try again"})
+			logFetch(name, http.StatusServiceUnavailable, time.Since(arrived), 0, udp.Stats{Budget: budget}, "busy")
 			return
 		}
+		queued := time.Since(arrived)
 
-		file_data, err := fetch(upstream, name)
+		started := time.Now()
+		file_data, stats, err := fetch(upstream, name, budget)
+		fetchTime := time.Since(started)
+		setStatsHeaders(c, stats, queued, fetchTime)
+		mOpens.Add(int64(stats.OpenAttempts))
+		mRounds.Add(int64(stats.RetryRounds))
+		mRety.Add(int64(stats.RetyRequests))
 		if err != nil {
 			c.Error(err)
 			status, message := statusFor(err)
+			if status == http.StatusGatewayTimeout {
+				mTimeout504.Inc()
+			} else {
+				mOther.Inc()
+			}
 			c.JSON(status, gin.H{"error": message})
+			logFetch(name, status, queued, fetchTime, stats, errKind(err))
 			return
 		}
+		mOK.Inc()
+		logFetch(name, http.StatusOK, queued, fetchTime, stats, "")
 
 		content_type := mime.TypeByExtension(filepath.Ext(name))
 		if content_type == "" {
@@ -248,4 +317,68 @@ func statusFor(err error) (int, string) {
 		return http.StatusBadGateway, "the file server rejected the request"
 	}
 	return http.StatusGatewayTimeout, "the file server did not respond"
+}
+
+// taskHost identifies the gateway task in headers and logs.
+var taskHost, _ = os.Hostname()
+
+// budgetFromQuery applies the open_attempts, retry_rounds and read_timeout_ms query parameters.
+func budgetFromQuery(c *gin.Context, budget udp.Budget) udp.Budget {
+	if v, err := strconv.Atoi(c.Query("open_attempts")); err == nil && v >= 1 && v <= 50 {
+		budget.OpenAttempts = v
+	}
+	if v, err := strconv.Atoi(c.Query("retry_rounds")); err == nil && v >= 0 && v <= 50 {
+		budget.RetryRounds = v
+	}
+	if v, err := strconv.Atoi(c.Query("read_timeout_ms")); err == nil && v >= 50 && v <= 10000 {
+		budget.ReadTimeout = time.Duration(v) * time.Millisecond
+	}
+	return budget
+}
+
+// setStatsHeaders exposes what the transfer did, so a load generator can record retries per request.
+func setStatsHeaders(c *gin.Context, stats udp.Stats, queued time.Duration, fetchTime time.Duration) {
+	h := c.Header
+	h("X-Task", taskHost)
+	h("X-Queue-Wait-Ms", strconv.FormatInt(queued.Milliseconds(), 10))
+	h("X-Fetch-Ms", strconv.FormatInt(fetchTime.Milliseconds(), 10))
+	h("X-Open-Attempts", strconv.Itoa(stats.OpenAttempts))
+	h("X-Retry-Rounds", strconv.Itoa(stats.RetryRounds))
+	h("X-Rety-Sent", strconv.Itoa(stats.RetyRequests))
+	h("X-Redials", strconv.Itoa(stats.Redials))
+	h("X-Chunks", strconv.Itoa(stats.Chunks))
+	h("X-Datagrams-Received", strconv.Itoa(stats.DatagramsReceived))
+	h("X-Duplicate-Datagrams", strconv.Itoa(stats.DuplicateDatagrams))
+	h("X-Missing-After-Open", strconv.Itoa(stats.MissingAfterOpen))
+	h("X-Missing-At-End", strconv.Itoa(stats.MissingAtEnd))
+	h("X-Budget", fmt.Sprintf("%d/%d/%d", stats.Budget.OpenAttempts, stats.Budget.RetryRounds, stats.Budget.ReadTimeout.Milliseconds()))
+}
+
+// errKind names a fetch failure for the log.
+func errKind(err error) string {
+	switch {
+	case errors.Is(err, udp.ErrNoData):
+		return "no-data"
+	case errors.Is(err, udp.ErrIncomplete):
+		return "incomplete"
+	}
+	var se *udp.ServerError
+	if errors.As(err, &se) {
+		return "server-" + se.Message
+	}
+	return "network"
+}
+
+// logFetch prints one JSON line per file request (CloudWatch Logs Insights can query it).
+func logFetch(name string, status int, queued time.Duration, fetchTime time.Duration, stats udp.Stats, failure string) {
+	line, _ := json.Marshal(map[string]any{
+		"evt": "fetch", "ts": time.Now().UTC().Format(time.RFC3339Nano), "task": taskHost,
+		"file": name, "status": status, "queue_ms": queued.Milliseconds(), "fetch_ms": fetchTime.Milliseconds(),
+		"open_attempts": stats.OpenAttempts, "retry_rounds": stats.RetryRounds, "rety_sent": stats.RetyRequests,
+		"redials": stats.Redials, "chunks": stats.Chunks, "datagrams_rx": stats.DatagramsReceived,
+		"dup_rx": stats.DuplicateDatagrams, "missing_after_open": stats.MissingAfterOpen,
+		"missing_at_end": stats.MissingAtEnd, "failure": failure,
+		"budget_open": stats.Budget.OpenAttempts, "budget_rounds": stats.Budget.RetryRounds,
+	})
+	fmt.Println(string(line))
 }

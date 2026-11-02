@@ -19,7 +19,14 @@ terraform {
 
 # The provider of your cloud service, in this case it is AWS.
 provider "aws" {
-  region = "us-west-2" # Which region you are working on
+  region = var.region # Which region you are working on (midterm: us-east-1)
+
+  # Midterm: tag everything this stack creates so leftovers can be found by tag
+  default_tags {
+    tags = {
+      Project = "cs6650-midterm"
+    }
+  }
 }
 
 # Existing bucket the server fetches requested files from. LabRole cannot manage buckets, so

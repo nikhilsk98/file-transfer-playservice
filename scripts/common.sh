@@ -2,7 +2,7 @@
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TF_DIR=$ROOT/terraform
-export AWS_REGION=${AWS_REGION:-us-west-2}
+export AWS_REGION=${AWS_REGION:-us-east-1}
 export AWS_DEFAULT_REGION=$AWS_REGION
 
 # These names are fixed in the Terraform files.
